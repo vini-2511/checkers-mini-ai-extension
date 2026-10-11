@@ -1,0 +1,602 @@
+"""Checkers Mini AI: Explainable Engine and Tournament Scheduler."""
+from dataclasses import dataclass
+from collections import defaultdict
+import csv
+import json
+import random
+
+N, EMPTY, AI, OPP = 8, ".", "a", "b"
+
+
+@dataclass(frozen=True)
+class Move:
+    path: tuple
+    captures: tuple = ()
+
+    def __str__(self):
+        route = " -> ".join(f"({r},{c})" for r, c in self.path)
+        return route + (f" | captures={list(self.captures)}"
+                        if self.captures else "")
+
+
+def owner(piece):
+    return piece.lower() if piece != EMPTY else None
+
+
+def is_king(piece):
+    return piece != EMPTY and piece.isupper()
+
+
+def inside(r, c):
+    return 0 <= r < N and 0 <= c < N
+
+
+def directions(piece):
+    if is_king(piece):
+        return [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+    return [(-1, -1), (-1, 1)] if owner(piece) == AI else [(1, -1), (1, 1)]
+
+
+def copy_board(board):
+    return [row[:] for row in board]
+
+
+def initial_board():
+    board = [[EMPTY] * N for _ in range(N)]
+    for r in range(3):
+        for c in range(N):
+            if (r + c) % 2:
+                board[r][c] = OPP
+    for r in range(5, 8):
+        for c in range(N):
+            if (r + c) % 2:
+                board[r][c] = AI
+    return board
+
+
+def render_board(board):
+    lines = ["  " + " ".join(map(str, range(N)))]
+    lines += [f"{r} " + " ".join(row)
+              for r, row in enumerate(board)]
+    return "\n".join(lines)
+
+
+def piece_moves(board, r, c):
+    """Generate ordinary moves and complete multi-jump captures."""
+    piece = board[r][c]
+    if piece == EMPTY:
+        return [], []
+
+    normal, captures = [], []
+
+    def explore(b, rr, cc, path, taken):
+        p = b[rr][cc]
+        found = False
+
+        for dr, dc in directions(p):
+            mr, mc = rr + dr, cc + dc
+            tr, tc = rr + 2 * dr, cc + 2 * dc
+
+            if (inside(mr, mc) and inside(tr, tc)
+                and b[mr][mc] != EMPTY
+                and owner(b[mr][mc]) != owner(p)
+                and b[tr][tc] == EMPTY):
+
+                found = True
+                nb = copy_board(b)
+                nb[rr][cc] = EMPTY
+                nb[mr][mc] = EMPTY
+
+                landed = p
+                if owner(p) == AI and tr == 0:
+                    landed = "A"
+                elif owner(p) == OPP and tr == 7:
+                    landed = "B"
+
+                nb[tr][tc] = landed
+                explore(nb, tr, tc,
+                        path + ((tr, tc),),
+                        taken + ((mr, mc),))
+
+        if taken and not found:
+            captures.append(Move(path, taken))
+
+    explore(board, r, c, ((r, c),), ())
+
+    for dr, dc in directions(piece):
+        nr, nc = r + dr, c + dc
+        if inside(nr, nc) and board[nr][nc] == EMPTY:
+            normal.append(Move(((r, c), (nr, nc))))
+
+    return normal, captures
+
+
+def legal_moves(board, player):
+    normal, captures = [], []
+
+    for r in range(N):
+        for c in range(N):
+            if board[r][c] != EMPTY and owner(board[r][c]) == player:
+                moves, caps = piece_moves(board, r, c)
+                normal.extend(moves)
+                captures.extend(caps)
+
+    # A capture is compulsory whenever one is available.
+    return captures if captures else normal
+
+
+def apply_move(board, move):
+    new_board = copy_board(board)
+    sr, sc = move.path[0]
+    piece = new_board[sr][sc]
+
+    if piece == EMPTY:
+        raise ValueError("No piece at the starting square.")
+
+    new_board[sr][sc] = EMPTY
+
+    for r, c in move.captures:
+        new_board[r][c] = EMPTY
+
+    er, ec = move.path[-1]
+
+    if owner(piece) == AI and er == 0:
+        piece = "A"
+    elif owner(piece) == OPP and er == 7:
+        piece = "B"
+
+    new_board[er][ec] = piece
+    return new_board
+
+
+def count_pieces(board, player):
+    return sum(
+        1 for row in board for p in row
+        if p != EMPTY and owner(p) == player
+    )
+
+
+def evaluate(board):
+    """Positive evaluation favours the AI."""
+    material = kings = centre = 0.0
+
+    for r in range(N):
+        for c in range(N):
+            p = board[r][c]
+            if p == EMPTY:
+                continue
+
+            sign = 1 if owner(p) == AI else -1
+            material += sign * (3 if is_king(p) else 1)
+
+            if is_king(p):
+                kings += sign * 2
+
+            if 2 <= r <= 5 and 2 <= c <= 5:
+                centre += sign * 0.25
+
+    mobility = (
+        len(legal_moves(board, AI))
+        - len(legal_moves(board, OPP))
+    ) * 0.15
+
+    total = material + kings + mobility + centre
+
+    return {
+        "material": round(material, 2),
+        "king_advantage": round(kings, 2),
+        "mobility": round(mobility, 2),
+        "centre_control": round(centre, 2),
+        "total": round(total, 2)
+    }
+
+
+def terminal_score(board, depth):
+    if count_pieces(board, AI) == 0 or not legal_moves(board, AI):
+        return -1000 - depth
+
+    if count_pieces(board, OPP) == 0 or not legal_moves(board, OPP):
+        return 1000 + depth
+
+    return None
+
+
+def alphabeta(board, depth, alpha, beta, maximizing, player):
+    terminal = terminal_score(board, depth)
+
+    if terminal is not None:
+        return terminal, []
+
+    if depth == 0:
+        return evaluate(board)["total"], []
+
+    moves = legal_moves(board, player)
+
+    if not moves:
+        return (-1000 if player == AI else 1000), []
+
+    best_line = []
+
+    if maximizing:
+        best = float("-inf")
+
+        for move in moves:
+            score, line = alphabeta(
+                apply_move(board, move), depth - 1,
+                alpha, beta, False, OPP
+            )
+
+            if score > best:
+                best = score
+                best_line = [move] + line
+
+            alpha = max(alpha, best)
+
+            if beta <= alpha:
+                break
+
+    else:
+        best = float("inf")
+
+        for move in moves:
+            score, line = alphabeta(
+                apply_move(board, move), depth - 1,
+                alpha, beta, True, AI
+            )
+
+            if score < best:
+                best = score
+                best_line = [move] + line
+
+            beta = min(beta, best)
+
+            if beta <= alpha:
+                break
+
+    return best, best_line
+
+
+def choose_move(board, player=AI, depth=3):
+    moves = legal_moves(board, player)
+
+    if not moves:
+        return None, [], evaluate(board)
+
+    options = []
+
+    for move in moves:
+        new_board = apply_move(board, move)
+
+        if player == AI:
+            score, continuation = alphabeta(
+                new_board, depth - 1,
+                float("-inf"), float("inf"),
+                False, OPP
+            )
+        else:
+            score, continuation = alphabeta(
+                new_board, depth - 1,
+                float("-inf"), float("inf"),
+                True, AI
+            )
+
+        options.append((score, move, [move] + continuation))
+
+    chosen = (max if player == AI else min)(
+        options, key=lambda item: item[0]
+    )
+
+    return (
+        chosen[1],
+        chosen[2],
+        evaluate(apply_move(board, chosen[1]))
+    )
+
+
+def sample_positions(number=20, seed=19):
+    """Create repeatable positions by making legal random moves."""
+    rng = random.Random(seed)
+    board = initial_board()
+    player = AI
+    positions = [copy_board(board)]
+
+    while len(positions) < number:
+        moves = legal_moves(board, player)
+
+        if not moves:
+            board = initial_board()
+            player = AI
+        else:
+            board = apply_move(board, rng.choice(moves))
+            player = OPP if player == AI else AI
+
+        positions.append(copy_board(board))
+
+    return positions[:number]
+
+
+def validate_position(board, player):
+    moves = legal_moves(board, player)
+    capture_exists = False
+
+    for r in range(N):
+        for c in range(N):
+            if board[r][c] != EMPTY and owner(board[r][c]) == player:
+                _, caps = piece_moves(board, r, c)
+                capture_exists |= bool(caps)
+
+    forced_ok = (
+        not capture_exists or all(m.captures for m in moves)
+    )
+
+    correct_side = all(
+        board[m.path[0][0]][m.path[0][1]] != EMPTY
+        and owner(board[m.path[0][0]][m.path[0][1]]) == player
+        for m in moves
+    )
+
+    coordinates_ok = all(
+        inside(r, c) for m in moves for r, c in m.path
+    )
+
+    return {
+        "moves": len(moves),
+        "forced_capture_ok": forced_ok,
+        "correct_side": correct_side,
+        "coordinates_ok": coordinates_ok,
+        "passed": forced_ok and correct_side and coordinates_ok
+    }
+
+
+def round_robin(players):
+    rotation = list(players)
+
+    if len(rotation) % 2:
+        rotation.append(None)
+
+    rounds = []
+    n = len(rotation)
+
+    for _ in range(n - 1):
+        pairs = []
+
+        for i in range(n // 2):
+            a, b = rotation[i], rotation[n - 1 - i]
+            if a is not None and b is not None:
+                pairs.append((a, b))
+
+        rounds.append(pairs)
+        rotation = [rotation[0], rotation[-1], *rotation[1:-1]]
+
+    return rounds
+
+
+def make_schedule(players, rooms, unavailable=None):
+    """Backtracking scheduler with room capacity and colour assignment."""
+    unavailable = {
+        p: set(rounds) for p, rounds in (unavailable or {}).items()
+    }
+
+    matches = []
+
+    for rnd, pairs in enumerate(round_robin(players), 1):
+        for a, b in pairs:
+            status = (
+                "UNAVAILABLE"
+                if rnd in unavailable.get(a, set())
+                or rnd in unavailable.get(b, set())
+                else "PENDING"
+            )
+
+            matches.append({
+                "round": rnd,
+                "player1": a,
+                "player2": b,
+                "room": "",
+                "player1_colour": "",
+                "player2_colour": "",
+                "status": status
+            })
+
+    todo = [m for m in matches if m["status"] == "PENDING"]
+    used = defaultdict(int)
+    balance = defaultdict(lambda: {"red": 0, "black": 0})
+    assigned = {}
+
+    def search(i):
+        if i == len(todo):
+            return True
+
+        match = todo[i]
+        rnd = match["round"]
+        a, b = match["player1"], match["player2"]
+
+        room_options = [
+            room for room, capacity in rooms.items()
+            if used[(rnd, room)] < capacity
+        ]
+
+        colour_options = [("red", "black"), ("black", "red")]
+        colour_options.sort(
+            key=lambda pair:
+            balance[a][pair[0]] + balance[b][pair[1]]
+        )
+
+        for room in room_options:
+            for ca, cb in colour_options:
+                used[(rnd, room)] += 1
+                balance[a][ca] += 1
+                balance[b][cb] += 1
+                assigned[id(match)] = (room, ca, cb)
+
+                # Forward checking: remaining matches need a room.
+                feasible = all(
+                    any(
+                        used[(other["round"], r)] < cap
+                        for r, cap in rooms.items()
+                    )
+                    for other in todo[i + 1:]
+                )
+
+                if feasible and search(i + 1):
+                    return True
+
+                used[(rnd, room)] -= 1
+                balance[a][ca] -= 1
+                balance[b][cb] -= 1
+                assigned.pop(id(match), None)
+
+        return False
+
+    if not search(0):
+        raise RuntimeError("No feasible schedule. Increase room capacity.")
+
+    for match in todo:
+        room, ca, cb = assigned[id(match)]
+        match["room"] = room
+        match["player1_colour"] = ca
+        match["player2_colour"] = cb
+        match["status"] = "SCHEDULED"
+
+    return matches
+
+
+def play_game(depth_a, depth_b, max_plies=40):
+    board = initial_board()
+    player = AI
+    history = []
+
+    for ply in range(1, max_plies + 1):
+        if not legal_moves(board, player):
+            return (OPP if player == AI else AI), len(history)
+
+        depth = depth_a if player == AI else depth_b
+        move, pv, explanation = choose_move(board, player, depth)
+
+        history.append({
+            "ply": ply,
+            "player": player,
+            "move": str(move),
+            "evaluation": explanation,
+            "principal_variation": [str(m) for m in pv[:4]]
+        })
+
+        board = apply_move(board, move)
+        player = OPP if player == AI else AI
+
+        if count_pieces(board, AI) == 0 or count_pieces(board, OPP) == 0:
+            break
+
+    return "DRAW_OR_MOVE_LIMIT", len(history)
+
+
+def main():
+    board = initial_board()
+
+    print("CHECKERS MINI AI - EXTENSION")
+    print("\nINITIAL BOARD")
+    print(render_board(board))
+
+    move, pv, explanation = choose_move(board, AI, depth=3)
+
+    print("\nAI RECOMMENDED MOVE")
+    print(move)
+
+    print("\nEXPLAINABLE AI - EVALUATION BREAKDOWN")
+    for key, value in explanation.items():
+        print(f"{key}: {value}")
+
+    print("\nPRINCIPAL VARIATION")
+    for i, move in enumerate(pv[:4], 1):
+        print(f"{i}. {move}")
+
+    rows = []
+
+    for pos_no, board in enumerate(sample_positions(20), 1):
+        for player in (AI, OPP):
+            rows.append({
+                "position": pos_no,
+                "player": player,
+                **validate_position(board, player)
+            })
+
+    with open("rule_validation_results.csv", "w", newline="",
+              encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    passed = sum(row["passed"] for row in rows)
+    print(f"\nRULE VALIDATION: {passed}/{len(rows)} "
+          "player-position checks passed.")
+
+    players = [
+        "Depth_1_AI", "Depth_2_AI",
+        "Depth_3_AI", "Depth_1_AI_B"
+    ]
+
+    schedule = make_schedule(
+        players,
+        {"Board_Room_A": 2, "Board_Room_B": 2}
+    )
+
+    with open("tournament_schedule.csv", "w", newline="",
+              encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=schedule[0].keys())
+        writer.writeheader()
+        writer.writerows(schedule)
+
+    depths = {
+        "Depth_1_AI": 1,
+        "Depth_2_AI": 2,
+        "Depth_3_AI": 3,
+        "Depth_1_AI_B": 1
+    }
+
+    results = []
+
+    for match in schedule:
+        winner, plies = play_game(
+            depths[match["player1"]],
+            depths[match["player2"]]
+        )
+
+        results.append({
+            **match,
+            "result": winner,
+            "plies": plies
+        })
+
+    with open("tournament_results.csv", "w", newline="",
+              encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
+
+    with open("sample_game_log.json", "w", encoding="utf-8") as file:
+        json.dump(results, file, indent=2)
+
+    print("\nTOURNAMENT SCHEDULE")
+    for match in schedule:
+        print(
+            f"Round {match['round']}: "
+            f"{match['player1']} ({match['player1_colour']}) vs "
+            f"{match['player2']} ({match['player2_colour']}) | "
+            f"{match['room']} | {match['status']}"
+        )
+
+    print("\nTOURNAMENT RESULTS")
+    for result in results:
+        print(
+            f"Round {result['round']}: "
+            f"{result['player1']} vs {result['player2']} -> "
+            f"{result['result']} ({result['plies']} plies)"
+        )
+
+    print("\nSaved: rule_validation_results.csv, "
+          "tournament_schedule.csv, tournament_results.csv, "
+          "sample_game_log.json")
+
+
+if __name__ == "__main__":
+    main()
